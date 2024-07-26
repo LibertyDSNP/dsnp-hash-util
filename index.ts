@@ -1,16 +1,5 @@
-import { CID } from "multiformats/cid";
-import { blake2b256 } from "@multiformats/blake2/blake2b";
-import type { Hasher } from "multiformats/hashes/hasher";
-import { sha256 } from "multiformats/hashes/sha2";
-import { decode, create } from "multiformats/hashes/digest";
-import { base58btc } from "multiformats/bases/base58";
-import { bases, bytes } from "multiformats/basics";
-import * as raw from "multiformats/codecs/raw";
-import * as Block from "multiformats/block";
-import * as dagPb from "@ipld/dag-pb";
-import { UnixFS } from "ipfs-unixfs";
-import { importBytes } from "ipfs-unixfs-importer";
-import { MemoryBlockstore } from "blockstore-core/memory";
+import { createBLAKE3, createSHA256 } from "hash-wasm";
+import type { IHasher } from "hash-wasm/dist/lib/WASMInterface.d.ts";
 
 function isEqualArray(first: Uint8Array, second: Uint8Array) {
   if (first.length != second.length) return false;
@@ -19,23 +8,37 @@ function isEqualArray(first: Uint8Array, second: Uint8Array) {
   return true;
 }
 
-type Base = {
-  prefix: string;
-  name: string;
-  decode(encoded: string): Uint8Array;
-};
+const B32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
+const B32_CODES = new Map(B32_ALPHABET.split("").map((k, i) => [k, i]));
 
-const basesByPrefix: Record<string, Base> = Object.fromEntries(
-  Object.entries(bases).map(([_k, codec]) => [codec.prefix, codec]),
-);
+function decodeBase32(input: string): Uint8Array | null {
+  const length = input.length;
+  const output = new Uint8Array((length * 5) / 8);
 
-const hashers: Record<number, Hasher<string, number>> = {};
-hashers[sha256.code] = sha256;
-hashers[blake2b256.code] = blake2b256;
+  let value = 0;
+  let bits = 0;
+  let index = 0;
 
-const codecs: Record<number, object> = {};
-codecs[dagPb.code] = dagPb;
-codecs[raw.code] = raw;
+  for (let i = 0; i < length; i++) {
+    const code = B32_CODES.get(input[i]);
+    if (code == undefined) return null;
+    value = (value << 5) | code;
+    bits += 5;
+
+    if (bits >= 8) {
+      output[index++] = (value >>> (bits - 8)) & 255;
+      bits -= 8;
+    }
+  }
+
+  return output;
+}
+
+const hashers: Record<number, () => Promise<IHasher>> = {};
+
+// See https://github.com/multiformats/multicodec/blob/master/table.csv
+hashers[0x12] = createSHA256;
+hashers[0x1e] = createBLAKE3;
 
 /**
  * Decodes a multibase encoded hash
@@ -46,38 +49,19 @@ codecs[raw.code] = raw;
 export const fromMultibase = (
   mbString: string,
 ): {
+  hasher: () => Promise<IHasher>;
   hash: Uint8Array;
-  base: string;
-  algCode: number;
-  codec: number | undefined;
 } | null => {
   const prefix = mbString[0];
-  const base = basesByPrefix[prefix];
-  if (base == null) {
-    return null;
-  }
-  try {
-    const decodedBase = base.decode(mbString);
-    if (decodedBase[0] === 0x01) {
-      // cidv1
-      const cid = CID.parse(mbString);
-      return {
-        base: base.name,
-        codec: cid.code,
-        algCode: cid.multihash.code,
-        hash: cid.multihash.digest,
-      };
-    }
-    const multihash = decode(decodedBase);
+  if (prefix !== "b") return null; // only base32 lowercase
+  const multihash = decodeBase32(mbString.substring(1));
+  if (multihash == null) return null;
+  if ((multihash[0] == 0x12 || multihash[0] == 0x1e) && multihash[1] == 0x20)
     return {
-      base: base.name,
-      codec: undefined,
-      algCode: multihash.code,
-      hash: multihash.digest,
+      hasher: hashers[multihash[0]],
+      hash: multihash.subarray(2, 34),
     };
-  } catch (e) {
-    return null;
-  }
+  return null;
 };
 
 async function findAsyncSequential<T>(
@@ -99,40 +83,15 @@ export async function compareBinaryToMultibaseHashes(
   const found = await findAsyncSequential(hashes, async (hash) => {
     const debased = fromMultibase(hash);
     if (debased === null) return false; // unknown base or parse error
-    if (debased.codec) {
-      const inputCID = await generateCID(
-        binary,
-        debased.codec === raw.code,
-        hashers[debased.algCode],
-      );
-      return inputCID === hash;
-    }
-    const hasher = hashers[debased.algCode];
+    const hasher = debased.hasher;
     if (hasher) {
-      const inputHash = await hasher.digest(binary);
-      if (isEqualArray(debased.hash, inputHash.digest)) return true;
+      const instance = await hasher();
+      instance.init();
+      instance.update(binary);
+      const digest = instance.digest("binary");
+      return isEqualArray(debased.hash, digest);
     }
-    return false; // unknown/unsupported hash algorithm
+    return false;
   });
   return found !== undefined;
-}
-
-export async function generateCID(
-  bytes: Uint8Array,
-  isRaw: boolean = false,
-  hasher: Hasher<string, number> = sha256,
-): Promise<string> {
-  let value;
-  if (isRaw) {
-    value = bytes;
-    const block = await Block.encode({ value, codec: raw, hasher });
-    return block.cid.toString();
-  } else {
-    // Note -- assumes dag-pb sha2-256
-    const blockstore = new MemoryBlockstore();
-    const entry = await importBytes(bytes, blockstore, {
-      rawLeaves: bytes.length > 256 * 1024,
-    });
-    return entry.cid.toString();
-  }
 }
