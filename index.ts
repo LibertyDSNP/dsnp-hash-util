@@ -44,9 +44,9 @@ hashers[0x1e] = createBLAKE3;
  * Decodes a multibase encoded hash
  * Does NOT throw errors
  * @param mbString - The multibase encoded string
- * @returns null if unable to decode or the base name, algorithm code, CID codec code (if the value was a CIDv1), and actual hash bytes
+ * @returns null if unable to decode or the base name, algorithm code, and actual hash bytes
  */
-export const fromMultibase = (
+const fromMultibase = (
   mbString: string,
 ): {
   hasher: () => Promise<IHasher>;
@@ -76,6 +76,11 @@ async function findAsyncSequential<T>(
   return undefined;
 }
 
+/**
+ * Checks whether any of the supplied multibase-encoded multihashes describe the binary.
+ * @param binary - The content to hash
+ * @param hashes - Array of multibase multihashes
+ */
 export async function compareBinaryToMultibaseHashes(
   binary: Uint8Array,
   hashes: string[],
